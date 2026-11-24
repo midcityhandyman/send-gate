@@ -57,8 +57,15 @@ class MockAdapter:
         self.fail_next: Optional[str] = None
         self.alter_next: Optional[Callable[[str], str]] = None
         self.lose_next = False
+        self.raise_next: Optional[BaseException] = None  # raised as is from send
+        self.read_back_error: Optional[BaseException] = None  # raised from read_back until cleared
+        self.send_calls = 0
 
     def send(self, *, channel: str, recipient: str, body: str, idempotency_key: str) -> SendReceipt:
+        self.send_calls += 1
+        if self.raise_next:
+            error, self.raise_next = self.raise_next, None
+            raise error
         if self.fail_next:
             reason, self.fail_next = self.fail_next, None
             raise SendError(reason)
@@ -78,6 +85,8 @@ class MockAdapter:
         return SendReceipt(message_id)
 
     def read_back(self, message_id: str) -> Optional[TargetMessage]:
+        if self.read_back_error:
+            raise self.read_back_error
         return self._messages.get(message_id)
 
     @property

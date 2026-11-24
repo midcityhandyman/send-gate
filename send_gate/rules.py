@@ -28,6 +28,12 @@ _RANK = {OK: 0, CAUTION: 1, STOP: 2}
 PHASES = ("submit", "approve", "send")
 
 
+# A pack marked "sample": true may carry this in place of a review date. The
+# gate then records the review date in its own database the first time it
+# runs with the pack. See Gate._pack and the README section "Rule pack review".
+FIRST_RUN = "first_run"
+
+
 class RulePackError(ValueError):
     """The rule pack file is missing or malformed."""
 
@@ -52,7 +58,7 @@ class BannedPhrase:
 @dataclass(frozen=True)
 class RulePack:
     version: str
-    reviewed_at: date
+    reviewed_at: Optional[date]  # None only for a sample pack the gate has not dated yet
     max_age_days: int
     hard_max_age_days: int
     quiet_timezone: str
@@ -63,11 +69,15 @@ class RulePack:
     same_recipient_gap_minutes: int
     banned_phrases: tuple
     sha256: str
+    sample: bool = False
+    review_date_source: str = "file"
 
     def summary(self) -> dict:
         return {
             "version": self.version,
-            "reviewed_at": self.reviewed_at.isoformat(),
+            "sample": self.sample,
+            "reviewed_at": self.reviewed_at.isoformat() if self.reviewed_at else None,
+            "review_date_source": self.review_date_source,
             "max_age_days": self.max_age_days,
             "hard_max_age_days": self.hard_max_age_days,
             "quiet_hours": {
@@ -122,9 +132,21 @@ def parse_rule_pack(text: str) -> RulePack:
             if not phrase:
                 raise RulePackError("banned phrase must not be empty")
             phrases.append(BannedPhrase(phrase, level, item.get("reason", "")))
+        sample = raw.get("sample", False)
+        if not isinstance(sample, bool):
+            raise RulePackError("sample must be true or false")
+        if raw["reviewed_at"] == FIRST_RUN:
+            if not sample:
+                raise RulePackError(
+                    'reviewed_at "first_run" is only allowed in a pack marked "sample": true; '
+                    "a real pack needs the date a person last reviewed it"
+                )
+            reviewed_at = None
+        else:
+            reviewed_at = date.fromisoformat(raw["reviewed_at"])
         pack = RulePack(
             version=str(raw["version"]),
-            reviewed_at=date.fromisoformat(raw["reviewed_at"]),
+            reviewed_at=reviewed_at,
             max_age_days=int(raw["max_age_days"]),
             hard_max_age_days=int(raw["hard_max_age_days"]),
             quiet_timezone=str(quiet["timezone"]),
@@ -135,6 +157,8 @@ def parse_rule_pack(text: str) -> RulePack:
             same_recipient_gap_minutes=int(dup["same_recipient_gap_minutes"]),
             banned_phrases=tuple(phrases),
             sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            sample=sample,
+            review_date_source="file" if reviewed_at else FIRST_RUN,
         )
     except (KeyError, TypeError) as exc:
         raise RulePackError(f"rule pack is missing a field: {exc}") from exc
@@ -235,9 +259,14 @@ def check_banned_phrases(pack: RulePack, body: str) -> CheckResult:
 
 def check_rule_pack_age(pack: RulePack, now: datetime) -> CheckResult:
     code = "stale_rule_pack"
-    today = now.astimezone(ZoneInfo(pack.quiet_timezone)).date()
-    age = (today - pack.reviewed_at).days
-    label = f"Rule pack {pack.version} was reviewed {age} day(s) ago"
+    if pack.reviewed_at is None:
+        # Fail closed: an undated pack must never pass as fresh.
+        return CheckResult(code, STOP, f"Rule pack {pack.version} has no review date.")
+    age = (pack_today(pack, now) - pack.reviewed_at).days
+    if pack.review_date_source == FIRST_RUN:
+        label = f"Sample rule pack {pack.version} was dated at first run, {age} day(s) ago"
+    else:
+        label = f"Rule pack {pack.version} was reviewed {age} day(s) ago"
     if age < 0:
         return CheckResult(code, CAUTION, f"Rule pack {pack.version} has a review date in the future.")
     if age > pack.hard_max_age_days:
@@ -245,6 +274,11 @@ def check_rule_pack_age(pack: RulePack, now: datetime) -> CheckResult:
     if age > pack.max_age_days:
         return CheckResult(code, CAUTION, f"{label}; the limit is {pack.max_age_days}. Review the pack soon.")
     return CheckResult(code, OK, f"{label}.")
+
+
+def pack_today(pack: RulePack, now: datetime) -> date:
+    """Today's date in the pack's timezone, the calendar the review age uses."""
+    return now.astimezone(ZoneInfo(pack.quiet_timezone)).date()
 
 
 def run_checks(

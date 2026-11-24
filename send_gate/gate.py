@@ -3,9 +3,16 @@
 Lifecycle of a draft:
 
     pending -> approved -> sending -> verified
-       |          |           |-> send_failed
-       |          |           `-> verify_failed
-       `----------`-> rejected
+       |          |           |-> send_failed      adapter refused or broke
+       |          |           |-> verify_failed    target holds other text, or none
+       |          |           `-> unverified       sent, read back did not answer
+       `----------`-> rejected                         |
+                                                       `-> verify() retries the
+                                                           read back, never the send
+
+No draft rests in sending. Whatever the adapter does, the send ends in one of
+the four states on the right, and a draft left in sending by a killed process
+is settled by verify().
 
 Rules that hold everywhere in this module:
 
@@ -16,6 +23,8 @@ Rules that hold everywhere in this module:
 * A stop verdict blocks approval and blocks the send.
 * After the adapter accepts a message the gate reads it back from the
   target and compares it to the approved hash before calling it verified.
+* A draft is handed to the adapter at most once. Nothing after the claim
+  puts it back to approved.
 * Every step, including every refusal, lands in the audit trail.
 """
 
@@ -25,7 +34,8 @@ import hashlib
 import json
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import date, datetime, timezone
 from typing import Callable, Optional
 
 from . import rules
@@ -41,9 +51,11 @@ from .fingerprint import (
 
 PENDING, APPROVED, REJECTED = "pending", "approved", "rejected"
 SENDING, VERIFIED = "sending", "verified"
-SEND_FAILED, VERIFY_FAILED = "send_failed", "verify_failed"
-STATUSES = (PENDING, APPROVED, REJECTED, SENDING, VERIFIED, SEND_FAILED, VERIFY_FAILED)
+SEND_FAILED, VERIFY_FAILED, UNVERIFIED = "send_failed", "verify_failed", "unverified"
+STATUSES = (PENDING, APPROVED, REJECTED, SENDING, VERIFIED, SEND_FAILED, VERIFY_FAILED, UNVERIFIED)
 EDITABLE = (PENDING, APPROVED)
+
+SAMPLE_REVIEW_KEY = "sample_pack_reviewed_at"
 
 GENESIS_HASH = "0" * 64
 
@@ -87,6 +99,8 @@ class Gate:
         self._pack_path = rule_pack_path
         self.adapter = adapter or MockAdapter(self._clock)
         rules.load_rule_pack(rule_pack_path)  # fail fast on a broken pack
+        with self._tx():
+            self._pack()  # dates a sample pack on the first run with this database
 
     # ------------------------------------------------------------------ helpers
 
@@ -97,11 +111,62 @@ class Gate:
         return self._clock().astimezone(timezone.utc)
 
     def rule_pack(self) -> rules.RulePack:
-        """Read the pack fresh each time so an edited file takes effect at once."""
+        """The pack in force, with its review date resolved."""
+        with self._tx():
+            return self._pack()
+
+    def _pack(self) -> rules.RulePack:
+        """Read the pack fresh each time so an edited file takes effect at once.
+
+        A real pack carries its own review date and is returned as read. A
+        sample pack ("sample": true, "reviewed_at": "first_run") has no date
+        in the file; its date is the day this database first saw a sample
+        pack, stored in the settings table. From there it ages like any
+        other pack. Call inside _tx.
+        """
         try:
-            return rules.load_rule_pack(self._pack_path)
+            pack = rules.load_rule_pack(self._pack_path)
         except rules.RulePackError as exc:
             raise GateError(503, "rule_pack_unavailable", str(exc), rollback=True) from exc
+        if pack.reviewed_at is None:
+            row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (SAMPLE_REVIEW_KEY,)).fetchone()
+            if row is None:
+                reviewed = self._date_sample_pack(pack, "gate", "first run with a sample rule pack")
+            else:
+                reviewed = date.fromisoformat(row["value"])
+            pack = replace(pack, reviewed_at=reviewed)
+        return pack
+
+    def _date_sample_pack(self, pack: rules.RulePack, actor: str, reason: str) -> date:
+        today = rules.pack_today(pack, self.now())
+        self._conn.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            (SAMPLE_REVIEW_KEY, today.isoformat(), iso(self.now())),
+        )
+        self._audit(
+            None,
+            actor,
+            "sample_pack_dated",
+            {"reviewed_at": today.isoformat(), "rule_pack": pack.version, "pack_sha256": pack.sha256, "reason": reason},
+        )
+        return today
+
+    def restamp_sample_pack(self, actor: str) -> dict:
+        """Record that a person re-read the sample pack today.
+
+        Only for a sample pack. A real pack is reviewed by editing
+        reviewed_at in its file, so the date travels with the rules.
+        """
+        with self._tx():
+            actor = _require_name(actor, "actor")
+            pack = self._pack()
+            if pack.review_date_source != rules.FIRST_RUN:
+                raise GateError(
+                    409, "not_a_sample_pack", "this pack carries its own review date; edit reviewed_at in the file"
+                )
+            reviewed = self._date_sample_pack(pack, actor, "sample pack reviewed again")
+            return replace(pack, reviewed_at=reviewed).summary()
 
     @contextmanager
     def _tx(self):
@@ -205,7 +270,7 @@ class Gate:
     def _run_checks(self, draft_id: int, phase: str, actor: str) -> tuple:
         """Run every rule, store the run, update the draft verdict."""
         draft = self._draft(draft_id)
-        pack = self.rule_pack()
+        pack = self._pack()
         results = rules.run_checks(
             pack,
             channel=draft["channel"],
@@ -447,24 +512,94 @@ class Gate:
                 receipt = self.adapter.send(
                     channel=draft["channel"], recipient=draft["recipient"], body=draft["body"], idempotency_key=key
                 )
+                message_id = receipt.message_id
+                if not isinstance(message_id, str) or not message_id:
+                    raise TypeError("adapter returned no message id")
             except SendError as exc:
-                self._conn.execute("UPDATE sends SET error = ? WHERE id = ?", (str(exc), send_id))
-                self._set_status(draft_id, SEND_FAILED)
-                self._audit(draft_id, "gate", "send_failed", {"send_id": send_id, "error": str(exc)})
+                self._close_failed_send(draft_id, send_id, str(exc))
                 raise GateError(502, "send_failed", f"adapter refused the message: {exc}") from exc
+            except Exception as exc:
+                # Anything else the adapter throws: a bug, a dropped socket, a
+                # malformed receipt. The message may or may not have gone out,
+                # so the draft is closed the same way and never retried here.
+                error = f"unexpected adapter error ({type(exc).__name__}): {exc}"
+                self._close_failed_send(draft_id, send_id, error, unexpected=True)
+                raise GateError(
+                    502, "send_failed", f"{error}; it is unknown whether the message went out"
+                ) from exc
 
             sent_at = iso(self.now())
             self._conn.execute(
                 "UPDATE sends SET provider_message_id = ?, sent_at = ? WHERE id = ?",
-                (receipt.message_id, sent_at, send_id),
+                (message_id, sent_at, send_id),
             )
-            self._audit(draft_id, "gate", "sent", {"send_id": send_id, "provider_message_id": receipt.message_id})
-            self._read_back(draft_id, send_id, receipt.message_id, current)
+            self._audit(draft_id, "gate", "sent", {"send_id": send_id, "provider_message_id": message_id})
+            self._conn.commit()  # the target id survives a crash inside the read back
+            self._read_back(draft_id, send_id, message_id, current)
+            return self._view(draft_id)
+
+    def _close_failed_send(self, draft_id: int, send_id: Optional[int], error: str, **detail) -> None:
+        if send_id is not None:
+            self._conn.execute("UPDATE sends SET error = ? WHERE id = ?", (error, send_id))
+        self._set_status(draft_id, SEND_FAILED)
+        self._audit(draft_id, "gate", "send_failed", {"send_id": send_id, "error": error, **detail})
+
+    def verify(self, draft_id: int, actor: str) -> dict:
+        """Finish a send that did not reach a final state. Never calls adapter.send.
+
+        unverified: the target accepted the message but the read back raised.
+        Reading is safe to repeat, so this tries it again.
+
+        sending: only a killed process leaves a draft here, because every
+        send runs to a final state under the gate's lock. If the target id
+        was recorded the read back is retried. If not, the gate cannot know
+        whether the message went out and closes the draft as send_failed.
+        """
+        with self._tx():
+            actor = _require_name(actor, "actor")
+            draft = self._draft(draft_id)
+            if draft["status"] not in (UNVERIFIED, SENDING):
+                raise GateError(409, "nothing_to_verify", f"draft is {draft['status']}; there is no open send")
+            send = self._conn.execute(
+                "SELECT * FROM sends WHERE draft_id = ? ORDER BY id DESC LIMIT 1", (draft_id,)
+            ).fetchone()
+            if send is None or not send["provider_message_id"]:
+                self._close_failed_send(
+                    draft_id,
+                    send["id"] if send else None,
+                    "interrupted before the adapter answered; it is unknown whether the message went out",
+                    settled_by=actor,
+                )
+                return self._view(draft_id)
+            self._audit(
+                draft_id,
+                actor,
+                "readback_retry",
+                {"send_id": send["id"], "provider_message_id": send["provider_message_id"]},
+            )
+            self._read_back(draft_id, send["id"], send["provider_message_id"], send["content_hash"])
             return self._view(draft_id)
 
     def _read_back(self, draft_id: int, send_id: int, message_id: str, approved_hash: str) -> None:
         """Fetch the message from the target and compare it to what was approved."""
-        seen = self.adapter.read_back(message_id)
+        try:
+            seen = self.adapter.read_back(message_id)
+            seen_hash = content_hash(seen.channel, seen.recipient, seen.body) if seen is not None else None
+        except Exception as exc:
+            # The message is out but unconfirmed. Not a failure of the text,
+            # so not verify_failed: park it where verify() can try again.
+            error = f"read back failed ({type(exc).__name__}): {exc}"
+            self._conn.execute(
+                "UPDATE sends SET readback_at = ?, error = ? WHERE id = ?", (iso(self.now()), error, send_id)
+            )
+            self._set_status(draft_id, UNVERIFIED)
+            self._audit(
+                draft_id,
+                "gate",
+                "readback_error",
+                {"send_id": send_id, "provider_message_id": message_id, "error": error},
+            )
+            return
         stamp = iso(self.now())
         if seen is None:
             self._conn.execute(
@@ -479,11 +614,10 @@ class Gate:
                 {"send_id": send_id, "provider_message_id": message_id, "reason": "not found on target"},
             )
             return
-        seen_hash = content_hash(seen.channel, seen.recipient, seen.body)
         matches = seen_hash == approved_hash and seen.message_id == message_id
         self._conn.execute(
-            "UPDATE sends SET readback_at = ?, target_timestamp = ?, readback_hash = ?, readback_ok = ? "
-            "WHERE id = ?",
+            "UPDATE sends SET readback_at = ?, target_timestamp = ?, readback_hash = ?, readback_ok = ?, "
+            "error = NULL WHERE id = ?",
             (stamp, seen.timestamp, seen_hash, int(matches), send_id),
         )
         detail = {

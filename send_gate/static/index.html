@@ -44,10 +44,11 @@
   <div class="mute">You approve the exact text shown. Any later change to body, recipient or channel voids the approval.</div>
   <div class="bar">
     <label>Approver <input id="approver" placeholder="your name" autocomplete="off"></label>
-    <label>Token <input id="token" type="password" placeholder="only if required" autocomplete="off"></label>
+    <label>Approver token <input id="token" type="password" placeholder="required" autocomplete="off"></label>
     <label>Show <select id="filter">
       <option value="pending">pending</option><option value="approved">approved</option>
       <option value="">all</option><option value="verified">verified</option>
+      <option value="unverified">unverified</option>
       <option value="verify_failed">verify_failed</option><option value="send_failed">send_failed</option>
       <option value="rejected">rejected</option></select></label>
     <button id="refresh">Refresh</button>
@@ -121,6 +122,13 @@ function card(d) {
       act(() => call("POST", "/drafts/" + d.id + "/send", {actor: a}), "Sent #" + d.id + " and read it back"); };
     bar.append(send);
   }
+  if (d.status === "unverified") {
+    bar.append(el("span", "caution", "Sent, but the read back did not answer."));
+    const retry = el("button", "primary", "Retry read back");
+    retry.onclick = () => { const a = approver(); if (!a) return;
+      act(() => call("POST", "/drafts/" + d.id + "/verify", {actor: a}), "Read back retried for #" + d.id); };
+    bar.append(retry);
+  }
   if (d.status === "pending" || d.status === "approved") {
     const no = el("button", "danger", "Reject");
     no.onclick = () => { const a = approver(); if (!a) return;
@@ -132,8 +140,9 @@ function card(d) {
   }
   for (const s of d.sends) {
     const good = s.readback_ok === 1;
-    bar.append(el("span", good ? "ok" : "stop",
-      (good ? "Read back verified: " : "Send problem: ") + (s.provider_message_id || "no id") +
+    const waiting = d.status === "unverified";
+    bar.append(el("span", good ? "ok" : (waiting ? "caution" : "stop"),
+      (good ? "Read back verified: " : (waiting ? "Not yet verified: " : "Send problem: ")) + (s.provider_message_id || "no id") +
       (s.target_timestamp ? " at " + s.target_timestamp : "") + (s.error ? " (" + s.error + ")" : "")));
   }
   c.append(bar);
@@ -155,6 +164,7 @@ function card(d) {
 
 async function load() {
   const status = $("filter").value;
+  if (!$("token").value) { say("Enter the approver token, then press Refresh.", "caution"); return; }
   try {
     const drafts = await call("GET", "/drafts" + (status ? "?status=" + status : ""));
     const list = $("list"); list.replaceChildren();
@@ -164,6 +174,7 @@ async function load() {
 }
 
 $("refresh").onclick = load; $("filter").onchange = load;
+$("token").onchange = load;
 load();
 </script>
 </body>

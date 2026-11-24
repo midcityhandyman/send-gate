@@ -25,6 +25,12 @@ PACK = {
 }
 
 
+AGENT_TOKEN = "test-agent-token-0001"
+APPROVER_TOKEN = "test-approver-token-0001"
+AS_AGENT = {"X-Agent-Token": AGENT_TOKEN}
+AS_HUMAN = {"X-Approver-Token": APPROVER_TOKEN}
+
+
 class FakeClock:
     """A clock the tests move by hand. Starts at 10:00 New York time."""
 
@@ -63,6 +69,37 @@ def gate(tmp_path, pack_path, adapter, clock):
     g = Gate(str(tmp_path / "gate.db"), str(pack_path), adapter=adapter, clock=clock)
     yield g
     g.close()
+
+
+@pytest.fixture
+def app(gate):
+    from send_gate.api import create_app
+
+    return create_app(gate, agent_token=AGENT_TOKEN, approver_token=APPROVER_TOKEN)
+
+
+@pytest.fixture
+def agent(app):
+    """HTTP client holding only the agent token."""
+    from fastapi.testclient import TestClient
+
+    return TestClient(app, headers=AS_AGENT)
+
+
+@pytest.fixture
+def human(app):
+    """HTTP client holding only the approver token."""
+    from fastapi.testclient import TestClient
+
+    return TestClient(app, headers=AS_HUMAN)
+
+
+@pytest.fixture
+def anon(app):
+    """HTTP client with no token."""
+    from fastapi.testclient import TestClient
+
+    return TestClient(app)
 
 
 def events(gate, draft_id):

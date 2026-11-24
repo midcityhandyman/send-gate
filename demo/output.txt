@@ -32,6 +32,8 @@ send-gate demo (offline, mock adapter, fixed clock)
    send: HTTP 200 status=verified verdict=caution
 
 4. Opt out list: a recipient who replied STOP
+   add opt out with the agent token: HTTP 401 approver_token_required
+   add opt out with the approver token: HTTP 201 added=True
    submit: HTTP 201 status=pending verdict=stop
       STOP    opt_out: +15555550163 opted out of sms (STOP reply).
    approve: HTTP 409 blocked_by_rules: a rule check returned stop
@@ -61,7 +63,38 @@ send-gate demo (offline, mock adapter, fixed clock)
       send record error: target content differs from approved text
       target holds: 'Hi Drew, your invoice total is 2400 dollars, due on the 30th.'
 
-8. Stale rule pack: nobody has reviewed the rules for a long time
+8. Tokens: the agent's credential cannot approve, and nothing works without one
+   submit with no token: HTTP 401 agent_token_required: a valid X-Agent-Token header is required
+   submit with the approver token: HTTP 401 agent_token_required: a valid X-Agent-Token header is required
+   submit: HTTP 201 status=pending verdict=ok
+   The agent tries to approve its own draft, under another name, with its own token:
+   approve: HTTP 401 approver_token_required: a valid X-Approver-Token header is required
+   It tries again with its token in the approver header:
+   approve: HTTP 401 approver_token_required: a valid X-Approver-Token header is required
+   list drafts with no token: HTTP 401 token_required
+   The human approves with the approver token:
+   approve: HTTP 200 status=approved verdict=ok
+   send: HTTP 200 status=verified verdict=ok
+
+9. Adapter trouble: a draft never stays in sending and is never sent twice
+   The adapter throws an error the gate was not written to expect:
+   submit: HTTP 201 status=pending verdict=ok
+   approve: HTTP 200 status=approved verdict=ok
+   send: HTTP 502 send_failed: unexpected adapter error (RuntimeError): connection reset by peer; it is unknown whether the message went out
+      draft is now send_failed
+   send: HTTP 409 not_approved: draft is send_failed, not approved
+   The target accepts a message, then its read back API goes down:
+   submit: HTTP 201 status=pending verdict=ok
+   approve: HTTP 200 status=approved verdict=ok
+   send: HTTP 200 status=unverified verdict=ok
+      send record error: read back failed (TimeoutError): read back timed out
+   send: HTTP 409 not_approved: draft is unverified, not approved
+   verify: HTTP 200 status=unverified verdict=ok
+   The read back API returns:
+   verify: HTTP 200 status=verified verdict=ok
+      read back ok=True, adapter send calls for this draft: 1
+
+10. Stale rule pack: nobody has reviewed the rules for a long time
    [clock] now 2026-12-15 15:00 UTC
    submit: HTTP 201 status=pending verdict=caution
       CAUTION stale_rule_pack: Rule pack demo-1 was reviewed 44 day(s) ago; the limit is 30. Review the pack soon.
@@ -71,7 +104,7 @@ send-gate demo (offline, mock adapter, fixed clock)
    approve: HTTP 409 blocked_by_rules: a rule check returned stop
       STOP    stale_rule_pack: Rule pack demo-1 was reviewed 92 day(s) ago; the hard limit is 60. Review the pack.
 
-9. Audit trail for draft 2 (the edited one)
+11. Audit trail for draft 2 (the edited one)
    2026-11-10T15:00:00Z  scheduler-bot   draft_submitted  {}
    2026-11-10T15:00:00Z  gate            checks_run       {"phase": "submit", "verdict": "ok"}
    2026-11-10T15:00:00Z  gate            checks_run       {"phase": "approve", "verdict": "ok"}
@@ -83,14 +116,17 @@ send-gate demo (offline, mock adapter, fixed clock)
    2026-11-10T15:00:00Z  Jordan Example  approve_refused  {"code": "text_changed", "reason": "the text you reviewed is not the current text; reload and review again"}
    2026-11-10T15:00:00Z  Jordan Example  rejected         {"reason": "not what we agreed"}
 
-10. Final state
-   draft 1: verified      verdict=ok      to +15555550142
-   draft 2: rejected      verdict=ok      to +15555550157
-   draft 3: verified      verdict=caution to pat.sample@example.com
-   draft 4: pending       verdict=stop    to +15555550163
-   draft 5: pending       verdict=stop    to +15555550142
-   draft 6: verified      verdict=ok      to +15555550171
-   draft 7: verify_failed verdict=ok      to +15555550188
-   draft 8: pending       verdict=stop    to +15555550190
-   messages on the mock target: 4
-   audit chain: ok=True entries=64
+12. Final state
+   draft  1: verified      verdict=ok      to +15555550142
+   draft  2: rejected      verdict=ok      to +15555550157
+   draft  3: verified      verdict=caution to pat.sample@example.com
+   draft  4: pending       verdict=stop    to +15555550163
+   draft  5: pending       verdict=stop    to +15555550142
+   draft  6: verified      verdict=ok      to +15555550171
+   draft  7: verify_failed verdict=ok      to +15555550188
+   draft  8: verified      verdict=ok      to +15555550112
+   draft  9: send_failed   verdict=ok      to +15555550125
+   draft 10: verified      verdict=ok      to +15555550136
+   draft 11: pending       verdict=stop    to +15555550190
+   messages on the mock target: 6
+   audit chain: ok=True entries=93

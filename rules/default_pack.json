@@ -1,6 +1,7 @@
 {
-  "version": "2026.11.1",
-  "reviewed_at": "2026-11-01",
+  "version": "sample-1",
+  "sample": true,
+  "reviewed_at": "first_run",
   "max_age_days": 90,
   "hard_max_age_days": 180,
   "quiet_hours": {

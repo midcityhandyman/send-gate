@@ -68,6 +68,14 @@ CREATE TABLE IF NOT EXISTS opt_outs (
     UNIQUE (channel, recipient)
 );
 
+-- Small facts the gate keeps about itself, such as the day a sample rule
+-- pack was first used with this database.
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     draft_id    INTEGER,

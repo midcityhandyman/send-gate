@@ -1,0 +1,3 @@
+# Every text file is stored and checked out with LF, on every platform, so
+# hashes, diffs and demo/output.txt are byte for byte the same everywhere.
+* text=auto eol=lf
