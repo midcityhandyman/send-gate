@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>send-gate approvals</title>
+<style>
+  :root { --bg:#f6f6f3; --card:#fff; --ink:#1c1c1a; --mute:#6b6b66; --line:#deded8;
+          --ok:#1d7a46; --caution:#9a6700; --stop:#b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161615; --card:#20201f; --ink:#ecece8; --mute:#a0a09a; --line:#3a3a37;
+            --ok:#5fcf8c; --caution:#e3b341; --stop:#ff8a80; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui, sans-serif; }
+  header, main { max-width: 860px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .mute { color: var(--mute); font-size: 13px; }
+  .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:12px; }
+  input, select, button { font: inherit; padding: 6px 10px; border:1px solid var(--line);
+    border-radius:6px; background:var(--card); color:var(--ink); }
+  button { cursor:pointer; }
+  button.primary { background:var(--ok); color:#fff; border-color:var(--ok); }
+  button.danger { color:var(--stop); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin:12px 0; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:space-between; }
+  .pill { font-size:12px; font-weight:600; padding:2px 8px; border-radius:99px; border:1px solid currentColor; }
+  .ok { color:var(--ok); } .caution { color:var(--caution); } .stop { color:var(--stop); }
+  pre.body { white-space:pre-wrap; word-break:break-word; background:var(--bg); border:1px solid var(--line);
+    border-radius:6px; padding:10px; margin:10px 0; font:14px/1.4 ui-monospace, Consolas, monospace; }
+  ul.checks { list-style:none; padding:0; margin:8px 0; }
+  ul.checks li { padding:3px 0; font-size:13px; }
+  .hash { font:12px ui-monospace, Consolas, monospace; color:var(--mute); word-break:break-all; }
+  details { margin-top:8px; font-size:13px; }
+  table { border-collapse:collapse; width:100%; font-size:12px; }
+  td { border-top:1px solid var(--line); padding:4px 6px; vertical-align:top; word-break:break-word; }
+  #msg { min-height:20px; margin-top:8px; font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>send-gate approvals</h1>
+  <div class="mute">You approve the exact text shown. Any later change to body, recipient or channel voids the approval.</div>
+  <div class="bar">
+    <label>Approver <input id="approver" placeholder="your name" autocomplete="off"></label>
+    <label>Token <input id="token" type="password" placeholder="only if required" autocomplete="off"></label>
+    <label>Show <select id="filter">
+      <option value="pending">pending</option><option value="approved">approved</option>
+      <option value="">all</option><option value="verified">verified</option>
+      <option value="verify_failed">verify_failed</option><option value="send_failed">send_failed</option>
+      <option value="rejected">rejected</option></select></label>
+    <button id="refresh">Refresh</button>
+  </div>
+  <div id="msg" role="status"></div>
+</header>
+<main id="list"></main>
+<script>
+// All draft content is inserted with textContent, never innerHTML.
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text; return n; };
+
+function say(text, level) { const m = $("msg"); m.textContent = text; m.className = level || ""; }
+
+async function call(method, path, body) {
+  const headers = {"Content-Type": "application/json"};
+  if ($("token").value) headers["X-Approver-Token"] = $("token").value;
+  const res = await fetch(path, {method, headers, body: body ? JSON.stringify(body) : undefined});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.message || ("HTTP " + res.status));
+  return data;
+}
+
+function approver() {
+  const name = $("approver").value.trim();
+  if (!name) { say("Enter your name as approver first.", "stop"); return null; }
+  return name;
+}
+
+async function act(fn, done) {
+  try { await fn(); say(done, "ok"); } catch (e) { say(e.message, "stop"); }
+  load();
+}
+
+function card(d) {
+  const c = el("div", "card");
+  const top = el("div", "row");
+  top.append(el("strong", "", "#" + d.id + "  " + d.channel + " to " + d.recipient));
+  const pills = el("span");
+  pills.append(el("span", "pill " + d.verdict, d.verdict), " ", el("span", "pill", d.status));
+  top.append(pills);
+  c.append(top, el("div", "mute", "from agent " + d.agent + (d.note ? " | " + d.note : "") + " | updated " + d.updated_at));
+  c.append(el("pre", "body", d.body), el("div", "hash", "content hash " + d.content_hash));
+
+  const checks = el("ul", "checks");
+  for (const r of (d.checks ? d.checks.results : [])) {
+    const li = el("li", r.level, r.level.toUpperCase() + "  " + r.code + ": " + r.detail);
+    checks.append(li);
+  }
+  c.append(checks);
+
+  const bar = el("div", "bar");
+  if (d.status === "pending") {
+    let ack = null;
+    if (d.verdict === "caution") {
+      const lab = el("label", "caution"); ack = el("input"); ack.type = "checkbox";
+      lab.append(ack, " I read the cautions"); bar.append(lab);
+    }
+    const ok = el("button", "primary", "Approve this exact text");
+    ok.disabled = d.verdict === "stop";
+    ok.onclick = () => { const a = approver(); if (!a) return;
+      act(() => call("POST", "/drafts/" + d.id + "/approve",
+        {approver: a, content_hash: d.content_hash, acknowledge_cautions: !!(ack && ack.checked)}), "Approved #" + d.id); };
+    bar.append(ok);
+  }
+  if (d.status === "approved") {
+    bar.append(el("span", "ok", "Approved by " + d.approval.approver + " at " + d.approval.approved_at));
+    const send = el("button", "primary", "Send now");
+    send.onclick = () => { const a = approver(); if (!a) return;
+      act(() => call("POST", "/drafts/" + d.id + "/send", {actor: a}), "Sent #" + d.id + " and read it back"); };
+    bar.append(send);
+  }
+  if (d.status === "pending" || d.status === "approved") {
+    const no = el("button", "danger", "Reject");
+    no.onclick = () => { const a = approver(); if (!a) return;
+      const reason = prompt("Reason for rejecting?") || "";
+      act(() => call("POST", "/drafts/" + d.id + "/reject", {approver: a, reason}), "Rejected #" + d.id); };
+    const again = el("button", "", "Re-run checks");
+    again.onclick = () => act(() => call("POST", "/drafts/" + d.id + "/recheck"), "Checks re-run for #" + d.id);
+    bar.append(no, again);
+  }
+  for (const s of d.sends) {
+    const good = s.readback_ok === 1;
+    bar.append(el("span", good ? "ok" : "stop",
+      (good ? "Read back verified: " : "Send problem: ") + (s.provider_message_id || "no id") +
+      (s.target_timestamp ? " at " + s.target_timestamp : "") + (s.error ? " (" + s.error + ")" : "")));
+  }
+  c.append(bar);
+
+  const trail = el("details"); trail.append(el("summary", "", "Audit trail"));
+  trail.addEventListener("toggle", async () => {
+    if (!trail.open || trail.dataset.loaded) return;
+    trail.dataset.loaded = "1";
+    const rows = await call("GET", "/drafts/" + d.id + "/audit");
+    const t = el("table");
+    for (const r of rows) { const tr = el("tr");
+      tr.append(el("td", "", r.ts), el("td", "", r.actor), el("td", "", r.event), el("td", "", JSON.stringify(r.detail)));
+      t.append(tr); }
+    trail.append(t);
+  });
+  c.append(trail);
+  return c;
+}
+
+async function load() {
+  const status = $("filter").value;
+  try {
+    const drafts = await call("GET", "/drafts" + (status ? "?status=" + status : ""));
+    const list = $("list"); list.replaceChildren();
+    if (!drafts.length) list.append(el("div", "card mute", "Nothing here."));
+    for (const d of drafts) list.append(card(d));
+  } catch (e) { say(e.message, "stop"); }
+}
+
+$("refresh").onclick = load; $("filter").onchange = load;
+load();
+</script>
+</body>
+</html>

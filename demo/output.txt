@@ -1,0 +1,96 @@
+send-gate demo (offline, mock adapter, fixed clock)
+============================================================
+   [clock] now 2026-11-10 15:00 UTC, which is 10:00 in New York
+
+1. Clean draft: checks pass, human approves, gate sends and reads back
+   submit: HTTP 201 status=pending verdict=ok
+   approve: HTTP 200 status=approved verdict=ok
+   send: HTTP 200 status=verified verdict=ok
+      target id mock-000001 at 2026-11-10T15:00:00Z, read back ok=True
+
+2. Edit after approval: the approval is void, the send is refused
+   submit: HTTP 201 status=pending verdict=ok
+   approve: HTTP 200 status=approved verdict=ok
+   edit: HTTP 200 status=pending verdict=ok
+      live approval after edit: None
+   send: HTTP 409 not_approved: draft is pending, not approved
+   The human tries to approve using the hash of the text they saw before the edit:
+   approve: HTTP 409 text_changed: the text you reviewed is not the current text; reload and review again
+   They reload, read the new text and reject it:
+   reject: HTTP 200 status=rejected verdict=ok
+
+3. Banned phrases: one stops the draft, one only cautions
+   submit: HTTP 201 status=pending verdict=stop
+      STOP    banned_phrases: Found "guaranteed" (stop: No guarantees in outbound messages.)
+   approve: HTTP 409 blocked_by_rules: a rule check returned stop
+      STOP    banned_phrases: Found "guaranteed" (stop: No guarantees in outbound messages.)
+   edit: HTTP 200 status=pending verdict=caution
+      CAUTION banned_phrases: Found "free" (caution: Check that the offer really is free.)
+   approve: HTTP 409 cautions_not_acknowledged: acknowledge the cautions to approve
+      CAUTION banned_phrases: Found "free" (caution: Check that the offer really is free.)
+   approve: HTTP 200 status=approved verdict=caution
+   send: HTTP 200 status=verified verdict=caution
+
+4. Opt out list: a recipient who replied STOP
+   submit: HTTP 201 status=pending verdict=stop
+      STOP    opt_out: +15555550163 opted out of sms (STOP reply).
+   approve: HTTP 409 blocked_by_rules: a rule check returned stop
+      STOP    opt_out: +15555550163 opted out of sms (STOP reply).
+
+5. Duplicate send: the same text to the same recipient two hours later
+   [clock] now 2026-11-10 17:00 UTC
+   submit: HTTP 201 status=pending verdict=stop
+      STOP    duplicate_send: The same text went to this recipient at 2026-11-10T15:00:00Z (draft 1), inside the 24 hour window.
+   approve: HTTP 409 blocked_by_rules: a rule check returned stop
+      STOP    duplicate_send: The same text went to this recipient at 2026-11-10T15:00:00Z (draft 1), inside the 24 hour window.
+
+6. Quiet hours: approval is allowed at night, the send is held until morning
+   [clock] now 2026-11-11 03:30 UTC
+   submit: HTTP 201 status=pending verdict=caution
+      CAUTION quiet_hours: Inside quiet hours (21:00 to 08:00 America/New_York). Approval is allowed but the send will be held.
+   approve: HTTP 200 status=approved verdict=caution
+   send: HTTP 409 blocked_by_rules: a rule check returned stop at send time
+      STOP    quiet_hours: Inside quiet hours (21:00 to 08:00 America/New_York). Send when the window opens.
+   [clock] now 2026-11-11 13:05 UTC
+   send: HTTP 200 status=verified verdict=ok
+
+7. Read back: the target stored something other than the approved text
+   submit: HTTP 201 status=pending verdict=ok
+   approve: HTTP 200 status=approved verdict=ok
+   send: HTTP 200 status=verify_failed verdict=ok
+      send record error: target content differs from approved text
+      target holds: 'Hi Drew, your invoice total is 2400 dollars, due on the 30th.'
+
+8. Stale rule pack: nobody has reviewed the rules for a long time
+   [clock] now 2026-12-15 15:00 UTC
+   submit: HTTP 201 status=pending verdict=caution
+      CAUTION stale_rule_pack: Rule pack demo-1 was reviewed 44 day(s) ago; the limit is 30. Review the pack soon.
+   [clock] now 2027-02-01 15:00 UTC
+   recheck: HTTP 200 status=pending verdict=stop
+      STOP    stale_rule_pack: Rule pack demo-1 was reviewed 92 day(s) ago; the hard limit is 60. Review the pack.
+   approve: HTTP 409 blocked_by_rules: a rule check returned stop
+      STOP    stale_rule_pack: Rule pack demo-1 was reviewed 92 day(s) ago; the hard limit is 60. Review the pack.
+
+9. Audit trail for draft 2 (the edited one)
+   2026-11-10T15:00:00Z  scheduler-bot   draft_submitted  {}
+   2026-11-10T15:00:00Z  gate            checks_run       {"phase": "submit", "verdict": "ok"}
+   2026-11-10T15:00:00Z  gate            checks_run       {"phase": "approve", "verdict": "ok"}
+   2026-11-10T15:00:00Z  Jordan Example  approved         {"verdict": "ok"}
+   2026-11-10T15:00:00Z  scheduler-bot   draft_edited     {"changed": ["body"]}
+   2026-11-10T15:00:00Z  gate            approval_voided  {"reason": "content changed: body"}
+   2026-11-10T15:00:00Z  gate            checks_run       {"phase": "submit", "verdict": "ok"}
+   2026-11-10T15:00:00Z  scheduler-bot   send_refused     {"code": "not_approved", "reason": "draft is pending, not approved"}
+   2026-11-10T15:00:00Z  Jordan Example  approve_refused  {"code": "text_changed", "reason": "the text you reviewed is not the current text; reload and review again"}
+   2026-11-10T15:00:00Z  Jordan Example  rejected         {"reason": "not what we agreed"}
+
+10. Final state
+   draft 1: verified      verdict=ok      to +15555550142
+   draft 2: rejected      verdict=ok      to +15555550157
+   draft 3: verified      verdict=caution to pat.sample@example.com
+   draft 4: pending       verdict=stop    to +15555550163
+   draft 5: pending       verdict=stop    to +15555550142
+   draft 6: verified      verdict=ok      to +15555550171
+   draft 7: verify_failed verdict=ok      to +15555550188
+   draft 8: pending       verdict=stop    to +15555550190
+   messages on the mock target: 4
+   audit chain: ok=True entries=64

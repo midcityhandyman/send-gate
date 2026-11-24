@@ -1,0 +1,23 @@
+{
+  "version": "2026.11.1",
+  "reviewed_at": "2026-11-01",
+  "max_age_days": 90,
+  "hard_max_age_days": 180,
+  "quiet_hours": {
+    "timezone": "America/New_York",
+    "start": "21:00",
+    "end": "08:00",
+    "channels": ["sms"]
+  },
+  "duplicate": {
+    "same_content_window_hours": 24,
+    "same_recipient_gap_minutes": 10
+  },
+  "banned_phrases": [
+    {"phrase": "guaranteed", "level": "stop", "reason": "No guarantees in outbound messages."},
+    {"phrase": "act now", "level": "stop", "reason": "Pressure language is not allowed."},
+    {"phrase": "final notice", "level": "stop", "reason": "Reads as a threat."},
+    {"phrase": "free", "level": "caution", "reason": "Check that the offer really is free."},
+    {"phrase": "asap", "level": "caution", "reason": "Give a real time instead."}
+  ]
+}
